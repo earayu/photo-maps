@@ -1,26 +1,70 @@
 import os
-from PIL import Image
+import hashlib
+from PIL import Image, ExifTags
 from PIL.ExifTags import TAGS, GPSTAGS
 import folium
 from folium.plugins import MarkerCluster, HeatMap
-import pandas as pd
-from datetime import datetime
+import json
+import toml
 from tqdm import tqdm
 from collections import defaultdict
 from math import radians, sin, cos, sqrt, atan2
-import json
+
+# 如果处理视频，需要安装 moviepy
+# pip install moviepy
+try:
+    from moviepy.editor import VideoFileClip
+except ImportError:
+    VideoFileClip = None
+
+
+class Config:
+    def __init__(self, config_file='config.toml'):
+        self.config_file = config_file
+        self.settings = self.load_config()
+
+    def load_config(self):
+        if not os.path.exists(self.config_file):
+            raise FileNotFoundError(f"配置文件 {self.config_file} 不存在。")
+        with open(self.config_file, 'r', encoding='utf-8') as f:
+            config = toml.load(f)
+        return config.get('settings', {})
 
 
 class PhotoMetaExtractor:
-    def __init__(self, photo_dir, output_dir="photo_data"):
-        self.photo_dir = photo_dir
-        self.output_dir = output_dir
+    def __init__(self, config):
+        self.photo_dir = config.get('source_directory')
+        self.output_dir = config.get('output_directory', "photo_data")
+        self.file_types = config.get('file_types', ['jpg', 'jpeg', 'png'])
         self.photos_data = []
         self.thumbnail_dir = os.path.join(self.output_dir, "thumbnails")
+        self.metadata_file = os.path.join(self.output_dir, "photos_metadata.json")
+        self.existing_md5 = set()
 
         # 创建输出目录
         os.makedirs(self.output_dir, exist_ok=True)
         os.makedirs(self.thumbnail_dir, exist_ok=True)
+
+        # 加载已有的元数据
+        self.load_existing_metadata()
+
+    def load_existing_metadata(self):
+        if os.path.exists(self.metadata_file):
+            with open(self.metadata_file, 'r', encoding='utf-8') as f:
+                existing_data = json.load(f)
+                self.existing_md5 = {item['md5'] for item in existing_data}
+                self.photos_data = existing_data
+                print(f"已加载 {len(self.photos_data)} 条已有的元数据。")
+        else:
+            self.existing_md5 = set()
+            self.photos_data = []
+
+    def _calculate_md5(self, file_path):
+        hash_md5 = hashlib.md5()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hash_md5.update(chunk)
+        return hash_md5.hexdigest()
 
     def _convert_to_degrees(self, value):
         d = float(value[0])
@@ -56,7 +100,7 @@ class PhotoMetaExtractor:
             result[key] = value
         return result
 
-    def get_image_info(self, image_path):
+    def get_image_info(self, image_path, md5_hash):
         try:
             image = Image.open(image_path)
             exif_data = image._getexif()
@@ -106,7 +150,8 @@ class PhotoMetaExtractor:
                 "coordinates": coordinates,
                 "thumbnail": os.path.abspath(thumbnail_path),
                 "original": os.path.abspath(image_path),
-                "exif": exif_serializable
+                "exif": exif_serializable,
+                "md5": md5_hash
             }
         except Exception as e:
             print(f"处理图片 {image_path} 时出错: {str(e)}")
@@ -115,17 +160,22 @@ class PhotoMetaExtractor:
     def process_photos(self):
         print("正在处理照片...")
         for filename in tqdm(os.listdir(self.photo_dir)):
-            if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+            if any(filename.lower().endswith(f".{ext.lower()}") for ext in self.file_types):
                 image_path = os.path.join(self.photo_dir, filename)
-                photo_info = self.get_image_info(image_path)
+                md5_hash = self._calculate_md5(image_path)
+                if md5_hash in self.existing_md5:
+                    print(f"文件 {filename} 未改变，跳过处理。")
+                    continue
+                photo_info = self.get_image_info(image_path, md5_hash)
                 if photo_info:
                     self.photos_data.append(photo_info)
+                    self.existing_md5.add(md5_hash)
 
-    def persist_metadata(self, file_path):
+    def persist_metadata(self):
         # 将元数据保存为 JSON 文件
-        with open(file_path, 'w', encoding='utf-8') as f:
+        with open(self.metadata_file, 'w', encoding='utf-8') as f:
             json.dump(self.photos_data, f, ensure_ascii=False, indent=4)
-        print(f"元数据已保存到: {file_path}")
+        print(f"元数据已保存到: {self.metadata_file}")
 
 
 class MapperPlotter:
@@ -146,8 +196,8 @@ class MapperPlotter:
         for i, photo in enumerate(photos_in_location):
             datetime_original = photo['exif'].get('DateTimeOriginal', '未知时间')
             photos_html += f"""
-                <div class="photo-item" data-src="file://{photo['original']}" data-filename="{photo['filename']}">
-                    <img src="file://{photo['thumbnail']}" class="photo-thumb">
+                <div class="photo-item" data-src="{os.path.relpath(photo['original'], self.output_dir)}" data-filename="{photo['filename']}">
+                    <img src="{os.path.relpath(photo['thumbnail'], self.output_dir)}" class="photo-thumb">
                     <div class="photo-info">
                         <div class="photo-name">{photo['filename']}</div>
                         <div class="photo-date">{datetime_original}</div>
@@ -303,7 +353,7 @@ class MapperPlotter:
             m.fit_bounds(coordinates)
 
         # 添加自定义 JavaScript 到地图
-        custom_js = """
+        custom_js = f"""
         <div id="image-modal" style="display:none; position:fixed; z-index:1000; left:0; top:0; width:100%; height:100%; background-color: rgba(0,0,0,0.9);">
             <span style="position:absolute; top:15px; right:35px; color:#f1f1f1; font-size:40px; font-weight:bold; cursor:pointer;">&times;</span>
             <img id="modal-image" style="margin:auto; display:block; width:80%; max-width:700px; max-height:80%; object-fit:contain;">
@@ -311,37 +361,37 @@ class MapperPlotter:
         </div>
 
         <script>
-        document.addEventListener('DOMContentLoaded', (event) => {
+        document.addEventListener('DOMContentLoaded', (event) => {{
             const modal = document.getElementById('image-modal');
             const modalImg = document.getElementById('modal-image');
             const captionText = document.getElementById('modal-caption');
             const closeBtn = modal.querySelector('span');
 
-            document.addEventListener('click', function(e) {
-                if (e.target.closest('.photo-item')) {
+            document.addEventListener('click', function(e) {{
+                if (e.target.closest('.photo-item')) {{
                     const item = e.target.closest('.photo-item');
                     modal.style.display = "block";
                     modalImg.src = item.getAttribute('data-src');
                     captionText.innerHTML = item.getAttribute('data-filename');
-                }
-            });
+                }}
+            }});
 
-            closeBtn.onclick = function() {
+            closeBtn.onclick = function() {{
                 modal.style.display = "none";
-            }
+            }}
 
-            window.onclick = function(event) {
-                if (event.target == modal) {
+            window.onclick = function(event) {{
+                if (event.target == modal) {{
                     modal.style.display = "none";
-                }
-            }
+                }}
+            }}
 
-            document.addEventListener('keydown', function(event) {
-                if (event.key === "Escape") {
+            document.addEventListener('keydown', function(event) {{
+                if (event.key === "Escape") {{
                     modal.style.display = "none";
-                }
-            });
-        });
+                }}
+            }});
+        }});
         </script>
         """
 
@@ -355,16 +405,16 @@ class MapperPlotter:
 
 # 使用示例
 if __name__ == "__main__":
-    photo_directory = "/Users/earayu/Desktop/vlog素材/测试"  # 使用您提供的实际路径
+    # 读取配置文件
+    config = Config('config.toml').settings
 
     # 创建 PhotoMetaExtractor 对象并处理照片
-    extractor = PhotoMetaExtractor(photo_directory)
+    extractor = PhotoMetaExtractor(config)
     extractor.process_photos()
 
     # 持久化元数据到文件
-    metadata_file = os.path.join(extractor.output_dir, "photos_metadata.json")
-    extractor.persist_metadata(metadata_file)
+    extractor.persist_metadata()
 
     # 创建 MapperPlotter 对象并绘制地图
-    plotter = MapperPlotter(metadata_file)
+    plotter = MapperPlotter(extractor.metadata_file, output_dir=config.get('output_directory', 'photo_map'))
     plotter.create_map()
