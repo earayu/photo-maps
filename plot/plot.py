@@ -11,6 +11,7 @@ from tqdm import tqdm
 from collections import defaultdict
 from math import radians, sin, cos, sqrt, atan2
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing
 
 # 如果处理视频，需要安装 moviepy
 # pip install moviepy
@@ -44,6 +45,7 @@ class PhotoMetaExtractor:
         self.thumbnail_dir = os.path.join(self.output_dir, "thumbnails")
         self.metadata_file = os.path.join(self.output_dir, "photos_metadata.json")
         self.existing_md5 = set()
+        self.concurrency = config.get('concurrency', multiprocessing.cpu_count())
 
         # 创建输出目录
         os.makedirs(self.output_dir, exist_ok=True)
@@ -185,7 +187,7 @@ class PhotoMetaExtractor:
     def process_photos(self):
         logging.info("开始处理照片...")
         files = os.listdir(self.photo_dir)
-        with ThreadPoolExecutor() as executor:
+        with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
             futures = {executor.submit(self.process_file, filename): filename for filename in files}
             for future in tqdm(as_completed(futures), total=len(futures), desc="处理照片"):
                 result = future.result()

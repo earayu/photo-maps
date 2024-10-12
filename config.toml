@@ -3,3 +3,6 @@ source_directory = "/Users/earayu/Desktop/vlog素材/测试"  # 替换为您的�
 output_directory = "/Users/earayu/Documents/GitHub/photo-maps/artifact"  # 替换为您的实际输出目录路径
 
 file_types = ["jpg", "jpeg", "png", "mp4", "mov"]  # 需要处理的文件类型
+
+# 设置并发数量为 4, 默认为CPU核心数量
+#concurrency = 4
