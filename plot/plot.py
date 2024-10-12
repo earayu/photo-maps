@@ -8,6 +8,7 @@ from datetime import datetime
 from tqdm import tqdm
 from collections import defaultdict
 from math import radians, sin, cos, sqrt, atan2
+import json
 
 
 class PhotoMetaExtractor:
@@ -15,13 +16,11 @@ class PhotoMetaExtractor:
         self.photo_dir = photo_dir
         self.output_dir = output_dir
         self.photos_data = []
-        self.thumbnail_dir = os.path.join(output_dir, "thumbnails")
+        self.thumbnail_dir = os.path.join(self.output_dir, "thumbnails")
 
         # 创建输出目录
         os.makedirs(self.output_dir, exist_ok=True)
         os.makedirs(self.thumbnail_dir, exist_ok=True)
-
-        self.dataframe = None
 
     def _convert_to_degrees(self, value):
         d = float(value[0])
@@ -34,48 +33,80 @@ class PhotoMetaExtractor:
         thumbnail.thumbnail(size)
         thumbnail.save(output_path, "JPEG")
 
+    def _convert_exif_to_serializable(self, exif_data):
+        """递归地将 EXIF 数据中的非序列化类型转换为可序列化类型"""
+        result = {}
+        for key, value in exif_data.items():
+            if isinstance(value, bytes):
+                try:
+                    value = value.decode('utf-8', 'ignore')
+                except Exception:
+                    value = str(value)
+            elif isinstance(value, (int, float, str)):
+                pass  # 基本类型，无需处理
+            elif isinstance(value, tuple):
+                value = tuple(
+                    self._convert_exif_to_serializable(
+                        {'': v}).get('') for v in value)
+            elif isinstance(value, dict):
+                value = self._convert_exif_to_serializable(value)
+            else:
+                # 尝试将其他类型转换为字符串
+                value = str(value)
+            result[key] = value
+        return result
+
     def get_image_info(self, image_path):
         try:
             image = Image.open(image_path)
-            exif = image._getexif()
+            exif_data = image._getexif()
 
-            if not exif:
+            if not exif_data:
                 return None
 
+            exif = {}
             gps_info = {}
-            datetime_original = None
+            for tag_id, value in exif_data.items():
+                tag = TAGS.get(tag_id, tag_id)
+                if tag == "GPSInfo":
+                    for key in value.keys():
+                        name = GPSTAGS.get(key, key)
+                        gps_info[name] = value[key]
+                    exif[tag] = gps_info
+                else:
+                    exif[tag] = value
 
-            for tag, value in exif.items():
-                tag_name = TAGS.get(tag, tag)
-                if tag_name == "GPSInfo":
-                    for gps_tag in value:
-                        sub_tag = GPSTAGS.get(gps_tag, gps_tag)
-                        gps_info[sub_tag] = value[gps_tag]
-                elif tag_name == "DateTimeOriginal":
-                    datetime_original = value
+            # 提取坐标信息
+            if "GPSInfo" in exif:
+                gps_info = exif["GPSInfo"]
 
-            if not gps_info:
-                return None
+                lat = self._convert_to_degrees(gps_info["GPSLatitude"])
+                if gps_info["GPSLatitudeRef"] in ["S", "南纬"]:
+                    lat = -lat
 
-            lat = self._convert_to_degrees(gps_info["GPSLatitude"])
-            if gps_info["GPSLatitudeRef"] == "S":
-                lat = -lat
+                lon = self._convert_to_degrees(gps_info["GPSLongitude"])
+                if gps_info["GPSLongitudeRef"] in ["W", "西经"]:
+                    lon = -lon
 
-            lon = self._convert_to_degrees(gps_info["GPSLongitude"])
-            if gps_info["GPSLongitudeRef"] == "W":
-                lon = -lon
+                coordinates = (lat, lon)
+            else:
+                return None  # 没有 GPS 信息
 
             # 生成缩略图
             filename = os.path.basename(image_path)
             thumbnail_path = os.path.join(self.thumbnail_dir, f"thumb_{filename}")
             self._create_thumbnail(image, thumbnail_path)
 
+            # 将 EXIF 数据转换为可序列化的格式
+            exif_serializable = self._convert_exif_to_serializable(exif)
+
             return {
                 "filename": filename,
-                "coordinates": (lat, lon),
-                "thumbnail": os.path.relpath(thumbnail_path, self.output_dir),
-                "original": os.path.relpath(image_path, self.output_dir),
-                "datetime": datetime_original
+                "full_path": os.path.abspath(image_path),
+                "coordinates": coordinates,
+                "thumbnail": os.path.abspath(thumbnail_path),
+                "original": os.path.abspath(image_path),
+                "exif": exif_serializable
             }
         except Exception as e:
             print(f"处理图片 {image_path} 时出错: {str(e)}")
@@ -90,37 +121,36 @@ class PhotoMetaExtractor:
                 if photo_info:
                     self.photos_data.append(photo_info)
 
-        # 将数据转换为 DataFrame
-        self.dataframe = pd.DataFrame(self.photos_data)
-
-    def persist_dataframe(self, file_path):
-        if self.dataframe is not None:
-            self.dataframe.to_csv(file_path, index=False)
-            print(f"元数据已保存到: {file_path}")
-        else:
-            print("DataFrame 为空，请先运行 process_photos() 方法。")
+    def persist_metadata(self, file_path):
+        # 将元数据保存为 JSON 文件
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(self.photos_data, f, ensure_ascii=False, indent=4)
+        print(f"元数据已保存到: {file_path}")
 
 
 class MapperPlotter:
-    def __init__(self, dataframe, output_dir="photo_map"):
-        self.dataframe = dataframe
+    def __init__(self, metadata_file, output_dir="photo_map"):
+        self.metadata_file = metadata_file
         self.output_dir = output_dir
-        self.photos_data = dataframe.to_dict('records')
-        self.thumbnail_dir = os.path.join(output_dir, "thumbnails")
 
         # 创建输出目录
         os.makedirs(self.output_dir, exist_ok=True)
+
+        # 加载元数据
+        with open(self.metadata_file, 'r', encoding='utf-8') as f:
+            self.photos_data = json.load(f)
 
     def _create_popup_html(self, photos_in_location):
         """创建增强的弹窗HTML，不包含JavaScript"""
         photos_html = ""
         for i, photo in enumerate(photos_in_location):
+            datetime_original = photo['exif'].get('DateTimeOriginal', '未知时间')
             photos_html += f"""
-                <div class="photo-item" data-src="{photo['original']}" data-filename="{photo['filename']}">
-                    <img src="{photo['thumbnail']}" class="photo-thumb">
+                <div class="photo-item" data-src="file://{photo['original']}" data-filename="{photo['filename']}">
+                    <img src="file://{photo['thumbnail']}" class="photo-thumb">
                     <div class="photo-info">
                         <div class="photo-name">{photo['filename']}</div>
-                        <div class="photo-date">{photo['datetime'] if photo['datetime'] else '未知时间'}</div>
+                        <div class="photo-date">{datetime_original}</div>
                     </div>
                 </div>
             """
@@ -176,18 +206,18 @@ class MapperPlotter:
         groups = defaultdict(list)
         processed = set()
 
-        for idx1, photo1 in self.dataframe.iterrows():
-            if idx1 in processed:
+        for i, photo1 in enumerate(self.photos_data):
+            if i in processed:
                 continue
 
             current_group = []
             current_group.append(photo1)
-            processed.add(idx1)
+            processed.add(i)
 
             lat1, lon1 = photo1['coordinates']
 
-            for idx2, photo2 in self.dataframe.iterrows():
-                if idx2 in processed:
+            for j, photo2 in enumerate(self.photos_data):
+                if j in processed:
                     continue
 
                 lat2, lon2 = photo2['coordinates']
@@ -202,7 +232,7 @@ class MapperPlotter:
 
                 if distance <= max_distance:
                     current_group.append(photo2)
-                    processed.add(idx2)
+                    processed.add(j)
 
             groups[len(groups)] = current_group
 
@@ -211,12 +241,12 @@ class MapperPlotter:
     def create_map(self):
         # 创建地图对象
         m = folium.Map(
-            tiles='https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
-            attr='&copy; OpenStreetMap contributors &copy; CARTO',
+            tiles='https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+            attr='&copy; OpenStreetMap contributors',
             zoom_start=12
         )
 
-        # 添加暗色主题
+        # 添加暗色主题（可选）
         folium.TileLayer(
             tiles='https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
             attr='&copy; OpenStreetMap contributors &copy; CARTO',
@@ -268,8 +298,8 @@ class MapperPlotter:
         folium.LayerControl().add_to(m)
 
         # 调整地图视角到所有照片的范围
-        if not self.dataframe.empty:
-            coordinates = self.dataframe['coordinates'].tolist()
+        if self.photos_data:
+            coordinates = [photo['coordinates'] for photo in self.photos_data]
             m.fit_bounds(coordinates)
 
         # 添加自定义 JavaScript 到地图
@@ -331,10 +361,10 @@ if __name__ == "__main__":
     extractor = PhotoMetaExtractor(photo_directory)
     extractor.process_photos()
 
-    # 持久化 DataFrame 到文件
-    metadata_file = os.path.join(extractor.output_dir, "photos_metadata.csv")
-    extractor.persist_dataframe(metadata_file)
+    # 持久化元数据到文件
+    metadata_file = os.path.join(extractor.output_dir, "photos_metadata.json")
+    extractor.persist_metadata(metadata_file)
 
     # 创建 MapperPlotter 对象并绘制地图
-    plotter = MapperPlotter(extractor.dataframe)
+    plotter = MapperPlotter(metadata_file)
     plotter.create_map()
