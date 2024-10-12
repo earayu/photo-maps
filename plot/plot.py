@@ -1,5 +1,6 @@
 import os
 import hashlib
+import logging
 from PIL import Image, ExifTags
 from PIL.ExifTags import TAGS, GPSTAGS
 import folium
@@ -9,6 +10,7 @@ import toml
 from tqdm import tqdm
 from collections import defaultdict
 from math import radians, sin, cos, sqrt, atan2
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # 如果处理视频，需要安装 moviepy
 # pip install moviepy
@@ -17,6 +19,8 @@ try:
 except ImportError:
     VideoFileClip = None
 
+# 配置日志
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class Config:
     def __init__(self, config_file='config.toml'):
@@ -54,17 +58,21 @@ class PhotoMetaExtractor:
                 existing_data = json.load(f)
                 self.existing_md5 = {item['md5'] for item in existing_data}
                 self.photos_data = existing_data
-                print(f"已加载 {len(self.photos_data)} 条已有的元数据。")
+                logging.info(f"已加载 {len(self.photos_data)} 条已有的元数据。")
         else:
             self.existing_md5 = set()
             self.photos_data = []
 
     def _calculate_md5(self, file_path):
         hash_md5 = hashlib.md5()
-        with open(file_path, "rb") as f:
-            for chunk in iter(lambda: f.read(4096), b""):
-                hash_md5.update(chunk)
-        return hash_md5.hexdigest()
+        try:
+            with open(file_path, "rb") as f:
+                for chunk in iter(lambda: f.read(4096), b""):
+                    hash_md5.update(chunk)
+            return hash_md5.hexdigest()
+        except Exception as e:
+            logging.error(f"计算文件 {file_path} 的 MD5 时出错: {e}")
+            return None
 
     def _convert_to_degrees(self, value):
         d = float(value[0])
@@ -73,9 +81,12 @@ class PhotoMetaExtractor:
         return d + (m / 60.0) + (s / 3600.0)
 
     def _create_thumbnail(self, image, output_path, size=(200, 200)):
-        thumbnail = image.copy()
-        thumbnail.thumbnail(size)
-        thumbnail.save(output_path, "JPEG")
+        try:
+            thumbnail = image.copy()
+            thumbnail.thumbnail(size)
+            thumbnail.save(output_path, "JPEG")
+        except Exception as e:
+            logging.error(f"创建缩略图 {output_path} 时出错: {e}")
 
     def _convert_exif_to_serializable(self, exif_data):
         """递归地将 EXIF 数据中的非序列化类型转换为可序列化类型"""
@@ -154,28 +165,42 @@ class PhotoMetaExtractor:
                 "md5": md5_hash
             }
         except Exception as e:
-            print(f"处理图片 {image_path} 时出错: {str(e)}")
+            logging.error(f"处理图片 {image_path} 时出错: {e}")
             return None
 
+    def process_file(self, filename):
+        if any(filename.lower().endswith(f".{ext.lower()}") for ext in self.file_types):
+            image_path = os.path.join(self.photo_dir, filename)
+            md5_hash = self._calculate_md5(image_path)
+            if not md5_hash:
+                return None
+            if md5_hash in self.existing_md5:
+                logging.info(f"文件 {filename} 未改变，跳过处理。")
+                return None
+            photo_info = self.get_image_info(image_path, md5_hash)
+            if photo_info:
+                return photo_info
+        return None
+
     def process_photos(self):
-        print("正在处理照片...")
-        for filename in tqdm(os.listdir(self.photo_dir)):
-            if any(filename.lower().endswith(f".{ext.lower()}") for ext in self.file_types):
-                image_path = os.path.join(self.photo_dir, filename)
-                md5_hash = self._calculate_md5(image_path)
-                if md5_hash in self.existing_md5:
-                    print(f"文件 {filename} 未改变，跳过处理。")
-                    continue
-                photo_info = self.get_image_info(image_path, md5_hash)
-                if photo_info:
-                    self.photos_data.append(photo_info)
-                    self.existing_md5.add(md5_hash)
+        logging.info("开始处理照片...")
+        files = os.listdir(self.photo_dir)
+        with ThreadPoolExecutor() as executor:
+            futures = {executor.submit(self.process_file, filename): filename for filename in files}
+            for future in tqdm(as_completed(futures), total=len(futures), desc="处理照片"):
+                result = future.result()
+                if result:
+                    self.photos_data.append(result)
+                    self.existing_md5.add(result['md5'])
 
     def persist_metadata(self):
         # 将元数据保存为 JSON 文件
-        with open(self.metadata_file, 'w', encoding='utf-8') as f:
-            json.dump(self.photos_data, f, ensure_ascii=False, indent=4)
-        print(f"元数据已保存到: {self.metadata_file}")
+        try:
+            with open(self.metadata_file, 'w', encoding='utf-8') as f:
+                json.dump(self.photos_data, f, ensure_ascii=False, indent=4)
+            logging.info(f"元数据已保存到: {self.metadata_file}")
+        except Exception as e:
+            logging.error(f"保存元数据时出错: {e}")
 
 
 class MapperPlotter:
@@ -187,8 +212,16 @@ class MapperPlotter:
         os.makedirs(self.output_dir, exist_ok=True)
 
         # 加载元数据
-        with open(self.metadata_file, 'r', encoding='utf-8') as f:
-            self.photos_data = json.load(f)
+        self.photos_data = self.load_metadata()
+
+    def load_metadata(self):
+        try:
+            with open(self.metadata_file, 'r', encoding='utf-8') as f:
+                photos_data = json.load(f)
+                return photos_data
+        except Exception as e:
+            logging.error(f"加载元数据时出错: {e}")
+            return []
 
     def _create_popup_html(self, photos_in_location):
         """创建增强的弹窗HTML，不包含JavaScript"""
@@ -289,6 +322,10 @@ class MapperPlotter:
         return groups
 
     def create_map(self):
+        if not self.photos_data:
+            logging.warning("没有可用的照片数据，无法创建地图。")
+            return
+
         # 创建地图对象
         m = folium.Map(
             tiles='https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
@@ -399,14 +436,21 @@ class MapperPlotter:
 
         # 保存地图
         output_map = os.path.join(self.output_dir, "photo_map.html")
-        m.save(output_map)
-        print(f"地图已保存到: {output_map}")
+        try:
+            m.save(output_map)
+            logging.info(f"地图已保存到: {output_map}")
+        except Exception as e:
+            logging.error(f"保存地图时出错: {e}")
 
 
 # 使用示例
 if __name__ == "__main__":
     # 读取配置文件
-    config = Config('config.toml').settings
+    try:
+        config = Config('config.toml').settings
+    except Exception as e:
+        logging.error(f"加载配置文件时出错: {e}")
+        exit(1)
 
     # 创建 PhotoMetaExtractor 对象并处理照片
     extractor = PhotoMetaExtractor(config)
